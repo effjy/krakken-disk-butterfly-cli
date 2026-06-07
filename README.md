@@ -59,7 +59,7 @@ The permutation executes **8 rounds**, each composed of nine distinct layers in 
 
 The XOR-Rotation Butterfly Diffusion (XRBD) layer is the **central architectural novelty** of Krakken-2048. It solves the problem of mixing all 32 words of state such that every output word depends on every input word after a single pass, using only word-level XOR and rotation operations.
 
-**Definition:** Let $r_0, r_1, r_2, r_3, r_4$ be rotation constants $(13, 23, 37, 41, 53)$. For stage $k \in \{0,1,2,3,4\}$, let $\delta_k = 2^k \in \{1,2,4,8,16\}$. For all $i \in [32]$ with $(i \& \delta_k) = 0$, execute:
+**Definition:** Let $r_0, r_1, r_2, r_3, r_4$ be rotation constants $(13, 23, 37, 41, 53)$. For stage $k \in \{0,1,2,3,4\}$, let $\delta_k = 2^k \in \{1,2,4,8,16\}$. For all $i \in [32]$ with $(i \operatorname{\&} \delta_k) = 0$, execute:
 
 $$
 \begin{aligned}
@@ -73,7 +73,6 @@ $$
 - **Complete Dependency:** Achieves $\log_2(32) = 5$ stages for full word-level mixing (Theorem 2)
 - **Optimal:** Matches the theoretical lower bound for pairwise-mixing networks (Theorem 3)
 - **Rotation-Enhanced:** Asymmetric rotation constants break bit-aligned symmetries
-
 ### Layer 7 — PRESSURE: ARX Mixing
 
 After the Butterfly Diffusion layer connects all 32 words, PRESSURE introduces modular-arithmetic non-linearity via carry propagation that crosses byte boundaries.
