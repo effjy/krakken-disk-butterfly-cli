@@ -252,6 +252,12 @@ int vfs_get_file(vfs_context_t *ctx, const char *filename,
     int idx = vfs_find_file(ctx, filename);
     if (idx < 0) return -1;
 
+    /* Empty file: nothing to read, just report zero length. */
+    if (ctx->files[idx].size == 0) {
+        *size = 0;
+        return 0;
+    }
+
     uint8_t *temp_buffer = malloc(ctx->files[idx].size);
     if (!temp_buffer) {
         return -1;
@@ -284,25 +290,28 @@ int vfs_delete_file(vfs_context_t *ctx, const char *filename) {
     /* Securely wipe file data from cache */
     uint64_t file_offset = ctx->files[idx].offset;
     size_t file_size = ctx->files[idx].size;
-    
-    /* Create zero buffer for wiping */
-    uint8_t *zero_buffer = calloc(1, file_size);
-    if (!zero_buffer) {
-        return -1;
-    }
-    
-    int wipe_ok = (vfs_write_data(ctx, file_offset, zero_buffer, file_size) == 0);
-    free(zero_buffer);
 
-    if (!wipe_ok) {
-        /* Secure wipe failed — refuse to remove the file entry.
-         * Removing the entry without wiping would leave raw ciphertext
-         * of the deleted file sitting in unallocated space on disk. */
-        return -1;
+    /* Empty files occupy no data bytes — nothing to wipe, just drop the entry.
+     * (calloc(1, 0) may return NULL, which must not be treated as failure.) */
+    if (file_size > 0) {
+        uint8_t *zero_buffer = calloc(1, file_size);
+        if (!zero_buffer) {
+            return -1;
+        }
+
+        int wipe_ok = (vfs_write_data(ctx, file_offset, zero_buffer, file_size) == 0);
+        free(zero_buffer);
+
+        if (!wipe_ok) {
+            /* Secure wipe failed — refuse to remove the file entry.
+             * Removing the entry without wiping would leave raw ciphertext
+             * of the deleted file sitting in unallocated space on disk. */
+            return -1;
+        }
     }
 
     /* Force flush of wiped sectors to disk before updating the file table */
-    if (ctx->cache) {
+    if (ctx->cache && file_size > 0) {
         uint64_t start_sector = file_offset / VFS_SECTOR_SIZE;
         uint64_t end_sector   = (file_offset + file_size + VFS_SECTOR_SIZE - 1) / VFS_SECTOR_SIZE;
         for (uint64_t sector = start_sector; sector < end_sector; sector++) {

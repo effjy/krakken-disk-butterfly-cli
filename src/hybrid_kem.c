@@ -108,7 +108,8 @@ void wrap_hybrid_sk(const uint8_t *hybrid_sk, const uint8_t *master_key,
     permut2048_absorb(&ctx, (const uint8_t *)"WRAP", 4);
     permut2048_finalize(&ctx);
     permut2048_encrypt(&ctx, hybrid_sk, ciphertext_out, HYBRID_SK_LEN);
-    permut2048_squeeze(&ctx, ciphertext_out + HYBRID_SK_LEN, WRAP_ABYTES);
+    /* Corrected duplex tag; old volumes verify via the legacy fallback. */
+    permut2048_squeeze_tag(&ctx, ciphertext_out + HYBRID_SK_LEN, WRAP_ABYTES);
     secure_zero(&ctx, sizeof(ctx));
 }
 
@@ -125,10 +126,16 @@ int unwrap_hybrid_sk(uint8_t *hybrid_sk, const uint8_t *master_key,
     /* Decrypt into scratch; release plaintext only after authentication. */
     uint8_t plain[HYBRID_SK_LEN];
     permut2048_decrypt(&ctx, ciphertext, plain, HYBRID_SK_LEN);
-    uint8_t computed_tag[WRAP_ABYTES];
-    permut2048_squeeze(&ctx, computed_tag, WRAP_ABYTES);
+    /* Accept either the corrected tag (new volumes) or the legacy tag (old
+     * volumes). Squeezing WRAP_ABYTES never permutes internally, so the legacy
+     * read leaves the state intact for the corrected computation. */
+    uint8_t legacy_tag[WRAP_ABYTES], corrected_tag[WRAP_ABYTES];
+    permut2048_squeeze(&ctx, legacy_tag, WRAP_ABYTES);
+    permut2048_squeeze_tag(&ctx, corrected_tag, WRAP_ABYTES);
 
-    int ret = ct_memcmp(computed_tag, ciphertext + HYBRID_SK_LEN, WRAP_ABYTES);
+    const uint8_t *stored_tag = ciphertext + HYBRID_SK_LEN;
+    int ret = (ct_memcmp(corrected_tag, stored_tag, WRAP_ABYTES) == 0 ||
+               ct_memcmp(legacy_tag,    stored_tag, WRAP_ABYTES) == 0) ? 0 : -1;
     if (ret == 0) {
         memcpy(hybrid_sk, plain, HYBRID_SK_LEN);
     }

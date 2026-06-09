@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include "fuse_mount.h"
 
@@ -223,10 +224,17 @@ int stop_fuse_mount(volume_context_t *vol) {
         }
         
         if (g_mountpoint[0] != '\0') {
-            char cmd[2048];
-            snprintf(cmd, sizeof(cmd), "fusermount3 -q -u \"%s\"", g_mountpoint);
-            int ret = system(cmd);
-            (void)ret;
+            /* Unmount without a shell so a mountpoint containing shell
+             * metacharacters (quotes, $, ;, backticks) cannot inject commands. */
+            pid_t pid = fork();
+            if (pid == 0) {
+                execlp("fusermount3", "fusermount3", "-q", "-u",
+                       g_mountpoint, (char *)NULL);
+                _exit(127); /* exec failed */
+            } else if (pid > 0) {
+                int status;
+                waitpid(pid, &status, 0);
+            }
             g_mountpoint[0] = '\0';
         }
         

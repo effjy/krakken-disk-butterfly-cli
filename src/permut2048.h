@@ -17,6 +17,10 @@ void init_rc_vectors(void);
 /* Sponge functions */
 void permut2048_absorb(permut2048_ctx *ctx, const uint8_t *input, size_t len);
 void permut2048_squeeze(permut2048_ctx *ctx, uint8_t *output, size_t out_len);
+/* Duplex authentication tag: forces a permutation BEFORE squeezing so the tag
+ * is an independent function of the full transcript, not a copy of trailing
+ * ciphertext bytes. Use this (not permut2048_squeeze) for duplex MAC tags. */
+void permut2048_squeeze_tag(permut2048_ctx *ctx, uint8_t *output, size_t out_len);
 void permut2048_finalize(permut2048_ctx *ctx);
 void permut2048_hash(const uint8_t *input, size_t in_len, uint8_t *output, size_t out_len);
 void permut2048_xof(const uint8_t *input, size_t in_len, uint8_t *output, size_t out_len);

@@ -110,6 +110,23 @@ void permut2048_squeeze(permut2048_ctx *ctx, uint8_t *output, size_t out_len) {
 }
 
 /* =========================================================================
+ * Duplex authentication tag
+ *
+ * After permut2048_encrypt/decrypt the rate lanes of the state still hold the
+ * ciphertext just processed, so squeezing directly would emit a tag that is
+ * merely a copy of trailing ciphertext (providing no integrity).  Forcing one
+ * permutation first makes the squeezed bytes a pseudorandom function of the
+ * entire absorbed-and-duplexed transcript — a proper tag.
+ * ========================================================================= */
+void permut2048_squeeze_tag(permut2048_ctx *ctx, uint8_t *output, size_t out_len) {
+    if (!ctx || (!output && out_len)) return;
+    if (!out_len) return;
+    krakken_permute(ctx->state);
+    ctx->pos = 0;
+    permut2048_squeeze(ctx, output, out_len);
+}
+
+/* =========================================================================
  * One-shot hash
  * ========================================================================= */
 void permut2048_hash(const uint8_t *input, size_t in_len,

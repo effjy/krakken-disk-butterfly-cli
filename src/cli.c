@@ -322,6 +322,51 @@ static void action_close(void) {
     }
 }
 
+static void action_migrate(void) {
+    char path[512];
+    char password[256];
+
+    printf("\n--- Upgrade volume header (migrate to new format) ---\n");
+    printf("This re-seals the volume header with the corrected authentication\n");
+    printf("tag. Only the 32-byte header tag changes; your file data is NOT\n");
+    printf("touched. The volume stays openable by both the CLI and GUI builds.\n");
+    printf("\n");
+    printf(">>> BACK UP THE VOLUME FILE FIRST. <<<\n\n");
+
+    /* Operate on a closed file: drop any currently-open volume to avoid two
+     * handles writing the same container. */
+    close_current_volume();
+
+    printf("Volume file path: ");
+    fflush(stdout);
+    if (read_line(path, sizeof(path)) != 0 || path[0] == '\0') {
+        printf("Cancelled (no path given).\n");
+        return;
+    }
+
+    if (read_password("Password: ", password, sizeof(password), ask_show_password()) != 0 ||
+        password[0] == '\0') {
+        printf("Cancelled (no password).\n");
+        secure_zero(password, sizeof(password));
+        return;
+    }
+
+    printf("Verifying password and migrating (Argon2 needs ~1 GB RAM)...\n");
+    int result = volume_migrate_header(path, password);
+    secure_zero(password, sizeof(password));
+
+    if (result == 0) {
+        printf("Success: header upgraded to the new authenticated format.\n");
+        printf("Tip: re-run on this volume any time to confirm — it will report\n");
+        printf("     'already up to date'.\n");
+    } else if (result == 1) {
+        printf("Already up to date: this volume already uses the new header.\n");
+    } else {
+        printf("Migration failed. Causes: wrong password, corrupt header, or the\n");
+        printf("file is not writable. The volume was left unchanged.\n");
+    }
+}
+
 /* ----- main loop ----------------------------------------------------- */
 
 static void print_menu(void) {
@@ -333,13 +378,14 @@ static void print_menu(void) {
     printf(" 3. Mount a volume\n");
     printf(" 4. Unmount volume\n");
     printf(" 5. Close volume\n");
-    printf(" 6. Exit\n");
+    printf(" 6. Upgrade volume header (migrate)\n");
+    printf(" 7. Exit\n");
     printf("----------------------------------------\n");
     if (g_volume && g_volume->is_open) {
         printf(" [open: %s%s]\n", g_volume->path,
                g_volume->vfs.is_mounted ? " | mounted" : "");
     }
-    printf("Select an option [1-6]: ");
+    printf("Select an option [1-7]: ");
     fflush(stdout);
 }
 
@@ -385,7 +431,9 @@ int main(int argc, char **argv) {
             action_unmount();
         } else if (strcmp(choice, "5") == 0) {
             action_close();
-        } else if (strcmp(choice, "6") == 0 ||
+        } else if (strcmp(choice, "6") == 0) {
+            action_migrate();
+        } else if (strcmp(choice, "7") == 0 ||
                    strcmp(choice, "q") == 0 || strcmp(choice, "Q") == 0) {
             break;
         } else if (choice[0] == '\0') {

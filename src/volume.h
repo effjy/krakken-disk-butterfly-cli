@@ -29,4 +29,10 @@ int volume_close(volume_context_t *vol, progress_callback_t progress_cb, void *u
 int volume_mount(volume_context_t *vol);
 int volume_unmount(volume_context_t *vol);
 
+/* Re-seal an existing volume's header with the corrected authentication tag.
+ * Only the 32-byte tag changes; the header ciphertext and all sector data are
+ * left untouched (verified before writing). Idempotent.
+ * Returns: 0 = migrated, 1 = already up to date, -1 = wrong password / corrupt / I/O error. */
+int volume_migrate_header(const char *path, const char *password);
+
 #endif /* VOLUME_H */

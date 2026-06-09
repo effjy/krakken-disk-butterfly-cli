@@ -30,13 +30,18 @@ int volume_create(const char *path, size_t size_mb, const char *password,
     random_bytes(salt, SALT_SIZE);
     uint8_t header_nonce[HEADER_NONCE_LEN];
     random_bytes(header_nonce, HEADER_NONCE_LEN);
-    fwrite(salt, 1, SALT_SIZE, f);
-    fwrite(header_nonce, 1, HEADER_NONCE_LEN, f);
+    if (fwrite(salt, 1, SALT_SIZE, f) != SALT_SIZE ||
+        fwrite(header_nonce, 1, HEADER_NONCE_LEN, f) != HEADER_NONCE_LEN) {
+        fclose(f); return -1;
+    }
     /* Reserve space for encrypted header (will seek back) */
     long header_start = ftell(f);
-    uint8_t *header_placeholder = calloc(1, HEADER_RESERVE + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    size_t placeholder_len = HEADER_RESERVE + crypto_aead_xchacha20poly1305_ietf_ABYTES;
+    uint8_t *header_placeholder = calloc(1, placeholder_len);
     if (!header_placeholder) { fclose(f); return -1; }
-    fwrite(header_placeholder, 1, HEADER_RESERVE + crypto_aead_xchacha20poly1305_ietf_ABYTES, f);
+    if (fwrite(header_placeholder, 1, placeholder_len, f) != placeholder_len) {
+        free(header_placeholder); fclose(f); return -1;
+    }
     free(header_placeholder);
 
     /* Derive master key (V4) */
@@ -91,16 +96,20 @@ int volume_create(const char *path, size_t size_mb, const char *password,
     permut2048_absorb(&ctx, (const uint8_t *)"HEADER", 6);
     permut2048_finalize(&ctx);
     permut2048_encrypt(&ctx, plain_header, encrypted_header, HEADER_RESERVE);
-    permut2048_squeeze(&ctx, encrypted_header + HEADER_RESERVE, TAG_SIZE);
+    /* Corrected duplex tag (permute-then-squeeze). Old volumes carry the
+     * legacy degenerate tag and are still accepted on open via fallback. */
+    permut2048_squeeze_tag(&ctx, encrypted_header + HEADER_RESERVE, TAG_SIZE);
     
     secure_zero(&ctx, sizeof(ctx));
     secure_zero(master_key, KEY_SIZE);
 
     /* Write encrypted header at the reserved location */
-    fseek(f, header_start, SEEK_SET);
-    fwrite(encrypted_header, 1, sizeof(encrypted_header), f);
-    fflush(f);
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, header_start, SEEK_SET) != 0 ||
+        fwrite(encrypted_header, 1, sizeof(encrypted_header), f) != sizeof(encrypted_header) ||
+        fflush(f) != 0 ||
+        fseek(f, 0, SEEK_END) != 0) {
+        fclose(f); return -1;
+    }
 
     /* Setup VFS in memory using temporary data area */
     vfs_context_t vfs;
@@ -133,7 +142,14 @@ int volume_create(const char *path, size_t size_mb, const char *password,
             progress_cb("Encrypting volume", percent, 100, user_data);
         }
     }
-    fclose(f);
+    /* Flush + close: surface any deferred write error (e.g. disk full) so a
+     * truncated/corrupt volume is reported instead of silently "created". */
+    if (fclose(f) != 0) {
+        secure_zero(file_key, KEY_SIZE);
+        secure_zero(temp_data_area, vfs.data_size);
+        free(temp_data_area);
+        return -1;
+    }
 
     /* Report completion */
     if (progress_cb) progress_cb("Volume created", 100, 100, user_data);
@@ -181,13 +197,23 @@ int volume_open(const char *path, const char *password, volume_context_t *vol,
     permut2048_absorb(&ctx, (const uint8_t *)"HEADER", 6);
     permut2048_finalize(&ctx);
     permut2048_decrypt(&ctx, encrypted_header, plain_header, HEADER_RESERVE);
-    uint8_t computed_tag[TAG_SIZE];
-    permut2048_squeeze(&ctx, computed_tag, TAG_SIZE);
+    /* Two acceptable tags:
+     *   legacy_tag    – old (degenerate) scheme: squeeze with no leading permute.
+     *   corrected_tag – fixed scheme: permute-then-squeeze.
+     * Squeezing TAG_SIZE bytes never permutes the state internally, so the
+     * legacy read leaves the state intact for the corrected computation. */
+    uint8_t legacy_tag[TAG_SIZE], corrected_tag[TAG_SIZE];
+    permut2048_squeeze(&ctx, legacy_tag, TAG_SIZE);
+    permut2048_squeeze_tag(&ctx, corrected_tag, TAG_SIZE);
     secure_zero(&ctx, sizeof(ctx));
+
+    const uint8_t *stored_tag = encrypted_header + HEADER_RESERVE;
+    int tag_ok = (ct_memcmp(corrected_tag, stored_tag, TAG_SIZE) == 0) ||
+                 (ct_memcmp(legacy_tag,    stored_tag, TAG_SIZE) == 0);
 
     /* Authenticate the header, then confirm the magic (wrong password fails one
      * or both). */
-    if (ct_memcmp(computed_tag, encrypted_header + HEADER_RESERVE, TAG_SIZE) != 0 ||
+    if (!tag_ok ||
         memcmp(plain_header, KRAKKEN5_MAGIC, 8) != 0) {
         secure_zero(vol->master_key, KEY_SIZE);
         fclose(f); return -1;
@@ -394,5 +420,101 @@ int volume_unmount(volume_context_t *vol) {
     if (!vol->vfs.is_mounted) return -1;
     vol->vfs.is_mounted = 0;
     vol->is_mounted = 0;
+    return 0;
+}
+
+/*
+ * volume_migrate_header — upgrade an old (legacy-tag) volume header to the
+ * corrected authentication tag.
+ *
+ * The header keystream is a deterministic function of master_key, header_nonce
+ * and the "HEADER" domain, so re-encrypting the same plaintext reproduces the
+ * exact same ciphertext; only the trailing 32-byte tag changes from the legacy
+ * (degenerate) value to a real MAC over the whole header.  We verify the
+ * ciphertext is unchanged before writing, so a bug here can never corrupt the
+ * volume.  Sector data is never touched.
+ */
+int volume_migrate_header(const char *path, const char *password) {
+    FILE *f = fopen(path, "rb+");
+    if (!f) return -1;
+
+    uint8_t salt[SALT_SIZE];
+    uint8_t header_nonce[HEADER_NONCE_LEN];
+    if (fread(salt, 1, SALT_SIZE, f) != SALT_SIZE ||
+        fread(header_nonce, 1, HEADER_NONCE_LEN, f) != HEADER_NONCE_LEN) {
+        fclose(f); return -1;
+    }
+
+    long header_start = ftell(f);
+    if (header_start < 0) { fclose(f); return -1; }
+
+    uint8_t master_key[KEY_SIZE];
+    if (derive_master_key_v4(password, salt, master_key) != 0) {
+        fclose(f); return -1;
+    }
+
+    uint8_t encrypted_header[HEADER_RESERVE + TAG_SIZE];
+    if (fread(encrypted_header, 1, sizeof(encrypted_header), f) != sizeof(encrypted_header)) {
+        secure_zero(master_key, KEY_SIZE); fclose(f); return -1;
+    }
+
+    /* Decrypt and authenticate (accept legacy or corrected tag). */
+    uint8_t plain_header[HEADER_RESERVE];
+    permut2048_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.rate = PERMUT2048_RATE;
+    permut2048_absorb(&ctx, master_key, KEY_SIZE);
+    permut2048_absorb(&ctx, header_nonce, HEADER_NONCE_LEN);
+    permut2048_absorb(&ctx, (const uint8_t *)"HEADER", 6);
+    permut2048_finalize(&ctx);
+    permut2048_decrypt(&ctx, encrypted_header, plain_header, HEADER_RESERVE);
+    uint8_t legacy_tag[TAG_SIZE], corrected_tag[TAG_SIZE];
+    permut2048_squeeze(&ctx, legacy_tag, TAG_SIZE);
+    permut2048_squeeze_tag(&ctx, corrected_tag, TAG_SIZE);
+    secure_zero(&ctx, sizeof(ctx));
+
+    const uint8_t *stored = encrypted_header + HEADER_RESERVE;
+    int corrected_match = (ct_memcmp(corrected_tag, stored, TAG_SIZE) == 0);
+    int legacy_match    = (ct_memcmp(legacy_tag,    stored, TAG_SIZE) == 0);
+    int magic_ok        = (memcmp(plain_header, KRAKKEN5_MAGIC, 8) == 0);
+
+    if (!magic_ok || !(corrected_match || legacy_match)) {
+        secure_zero(master_key, KEY_SIZE);
+        secure_zero(plain_header, sizeof(plain_header));
+        fclose(f); return -1;            /* wrong password or corrupt header */
+    }
+    if (corrected_match) {
+        secure_zero(master_key, KEY_SIZE);
+        secure_zero(plain_header, sizeof(plain_header));
+        fclose(f); return 1;             /* already migrated — nothing to do */
+    }
+
+    /* Re-seal with the corrected tag. */
+    uint8_t resealed[HEADER_RESERVE + TAG_SIZE];
+    permut2048_ctx sctx;
+    memset(&sctx, 0, sizeof(sctx));
+    sctx.rate = PERMUT2048_RATE;
+    permut2048_absorb(&sctx, master_key, KEY_SIZE);
+    permut2048_absorb(&sctx, header_nonce, HEADER_NONCE_LEN);
+    permut2048_absorb(&sctx, (const uint8_t *)"HEADER", 6);
+    permut2048_finalize(&sctx);
+    permut2048_encrypt(&sctx, plain_header, resealed, HEADER_RESERVE);
+    permut2048_squeeze_tag(&sctx, resealed + HEADER_RESERVE, TAG_SIZE);
+    secure_zero(&sctx, sizeof(sctx));
+    secure_zero(plain_header, sizeof(plain_header));
+    secure_zero(master_key, KEY_SIZE);
+
+    /* Safety guard: the ciphertext MUST be unchanged — only the tag differs.
+     * If not, abort without writing rather than risk corrupting the header. */
+    if (memcmp(resealed, encrypted_header, HEADER_RESERVE) != 0) {
+        fclose(f); return -1;
+    }
+
+    if (fseek(f, header_start, SEEK_SET) != 0 ||
+        fwrite(resealed, 1, sizeof(resealed), f) != sizeof(resealed) ||
+        fflush(f) != 0) {
+        fclose(f); return -1;
+    }
+    if (fclose(f) != 0) return -1;
     return 0;
 }
