@@ -9,6 +9,7 @@
 [![Manual: PDF](https://img.shields.io/badge/%F0%9F%93%96_Manual-PDF-800080?style=flat-square&labelColor=1a1a1a)](MANUAL.pdf)
 
 <br>
+</div>
 
 **Krakken-Disk** is an ultra-secure, high-performance encrypted disk manager engineered specifically for the post-quantum era. Powered by the massive 2048-bit **Krakken Abyssal** permutation, Krakken-Disk provides a uniform 256-bit post-Grover security margin across all volume layers. By combining cutting-edge lattice-based cryptography, elliptic curve cryptography, and hardware-accelerated AVX2 SIMD architectures, it ensures your data remains completely private even against future quantum computing adversaries.
 
