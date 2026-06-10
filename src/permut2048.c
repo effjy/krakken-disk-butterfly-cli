@@ -4,7 +4,7 @@
  * This file contains only the sponge construction (absorb / finalize / squeeze).
  * All permutation work is delegated to krakken_permute_avx2() which lives in
  * krakken_multi.c, giving us:
- *   - 16 rounds Abyssal S-box (NL=112)
+ *   - 8 rounds Abyssal S-box (NL=112)
  *   - Register-only MDS (no memory spill)
  *   - 128-bit ARX intra-column pressure step
  *   - pthread_once thread-safe RC initialisation
@@ -58,7 +58,12 @@ void permut2048_absorb(permut2048_ctx *ctx, const uint8_t *input, size_t len) {
         ctx->pos += chunk;
         i        += chunk;
         if (ctx->pos == PERMUT2048_RATE) {
-            /* XOR rate portion into state */
+            /* XOR rate portion into state.
+             * NOTE: this type-pun is technically UB, but the on-disk format was
+             * defined by the exact code generated for it. Do NOT "fix" this to
+             * a memcpy load — under -O3 the optimizer may produce a different
+             * result, which changes the keystream/tag and renders every
+             * existing volume undecipherable. */
             const uint64_t *b64 = (const uint64_t*)ctx->buffer;
             for (int j = 0; j < (int)(PERMUT2048_RATE / 8); j++)
                 ctx->state[j] ^= b64[j];
@@ -82,6 +87,8 @@ void permut2048_finalize(permut2048_ctx *ctx) {
     ctx->buffer[ctx->pos]              = PERMUT2048_PAD_BYTE;
     ctx->buffer[PERMUT2048_RATE - 1]  ^= PERMUT2048_PAD_FINAL;
 
+    /* See the note in permut2048_absorb: do NOT convert this type-pun to a
+     * memcpy load — it would change the on-disk keystream/tag. */
     const uint64_t *b64 = (const uint64_t*)ctx->buffer;
     for (int j = 0; j < (int)(PERMUT2048_RATE / 8); j++)
         ctx->state[j] ^= b64[j];

@@ -62,7 +62,11 @@ int secure_shred_file(const char *path) {
             if (pass == 0) memset(buf, 0, chunk);
             else if (pass == 1) memset(buf, 0xFF, chunk);
             else random_bytes(buf, chunk);
-            fwrite(buf, 1, chunk, f);
+            if (fwrite(buf, 1, chunk, f) != chunk) {
+                free(buf);
+                fclose(f);
+                return -1;
+            }
             remaining -= chunk;
         }
         fflush(f);
