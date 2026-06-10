@@ -364,13 +364,29 @@ int vfs_read_data(vfs_context_t *ctx, uint64_t offset, uint8_t *buffer, size_t s
         return -1;
     }
 
+    /*
+     * Prefetch every sector this read touches, decrypting the missing ones in
+     * parallel, so the per-sector loop below hits warm cache entries.  Failure
+     * here is non-fatal except on authentication/I/O error, which we propagate.
+     */
+    if (size > 0) {
+        uint64_t first = offset / VFS_SECTOR_SIZE;
+        uint64_t last  = (offset + size - 1) / VFS_SECTOR_SIZE;
+        for (uint64_t s = first; s <= last; s += SECTOR_PREFETCH_CAP) {
+            size_t n = (size_t)(last - s + 1);
+            if (cache_prefetch_batch(ctx->cache, s, n) != 0) {
+                return -1;
+            }
+        }
+    }
+
     size_t bytes_read = 0;
     while (bytes_read < size) {
         uint64_t current_offset = offset + bytes_read;
         uint64_t sector_idx = current_offset / VFS_SECTOR_SIZE;
         size_t sector_offset = current_offset % VFS_SECTOR_SIZE;
         size_t bytes_to_copy = VFS_SECTOR_SIZE - sector_offset;
-        
+
         if (bytes_to_copy > size - bytes_read) {
             bytes_to_copy = size - bytes_read;
         }
@@ -409,7 +425,15 @@ int vfs_write_data(vfs_context_t *ctx, uint64_t offset, const uint8_t *buffer, s
         }
 
         uint8_t *sector_data;
-        if (cache_get_sector(ctx->cache, sector_idx, &sector_data) != 0) {
+        /*
+         * Full-sector overwrite: the entire sector is being replaced, so the
+         * old contents are irrelevant — skip the load + MAC + decrypt.  Partial
+         * writes still load-modify-write through cache_get_sector.
+         */
+        if (sector_offset == 0 && bytes_to_copy == VFS_SECTOR_SIZE) {
+            if (cache_get_sector_overwrite(ctx->cache, sector_idx, &sector_data) != 0)
+                return -1;
+        } else if (cache_get_sector(ctx->cache, sector_idx, &sector_data) != 0) {
             return -1;
         }
 

@@ -26,6 +26,8 @@
 #include <string.h>
 #include <sodium.h>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define DEFAULT_CACHE_SIZE  4096
 #define PER_SECTOR_MAC_SIZE 32
@@ -104,29 +106,179 @@ static void sector_mac(const uint8_t *sector_key, uint64_t idx,
 }
 
 /*
+ * sector_build_record – produce one on-disk V5 record for sector `idx` into
+ * `rec` (laid out [cipher][nonce][tag], SECTOR_RECORD_SIZE bytes).  Generates a
+ * fresh random nonce.  Pure with respect to shared state: it touches only the
+ * read-only `file_key`, the caller-owned `plain` input and `rec` output, so
+ * many records may be built concurrently from worker threads.  This is the
+ * single source of the on-disk format, shared by the serial write path and the
+ * parallel flush path so the two can never desync.
+ */
+static int encrypt_sector_at(sector_cache_t *cache, uint64_t sector_idx,
+                             const uint8_t *plain);
+
+static void sector_build_record(uint64_t idx, const uint8_t *file_key,
+                                const uint8_t *plain, uint8_t *rec) {
+    uint8_t *cipher = rec;
+    uint8_t *nonce  = rec + VFS_SECTOR_SIZE;
+    uint8_t *tag    = rec + VFS_SECTOR_SIZE + SECTOR_NONCE_SIZE;
+
+    uint8_t sector_key[KEY_SIZE];
+    derive_sector_key(file_key, idx, sector_key);
+
+    random_bytes(nonce, SECTOR_NONCE_SIZE);
+    sector_keystream_xor(sector_key, nonce, plain, cipher);
+    sector_mac(sector_key, idx, nonce, cipher, tag);
+
+    secure_zero(sector_key, KEY_SIZE);
+}
+
+/*
  * sector_encrypt_write – shared V5 sector encryptor (see header).  Generates a
  * fresh random nonce on every call, so rewriting a sector never reuses the
  * keystream.  Writes [cipher][nonce][tag] at the file's current position.
  */
 int sector_encrypt_write(FILE *f, uint64_t idx,
                          const uint8_t *file_key, const uint8_t *plain) {
-    uint8_t sector_key[KEY_SIZE];
-    derive_sector_key(file_key, idx, sector_key);
-
-    uint8_t nonce[SECTOR_NONCE_SIZE];
-    random_bytes(nonce, SECTOR_NONCE_SIZE);
-
-    uint8_t cipher[VFS_SECTOR_SIZE];
-    sector_keystream_xor(sector_key, nonce, plain, cipher);
-
-    uint8_t tag[PER_SECTOR_MAC_SIZE];
-    sector_mac(sector_key, idx, nonce, cipher, tag);
-    secure_zero(sector_key, KEY_SIZE);
-
-    int ok = (fwrite(cipher, 1, VFS_SECTOR_SIZE, f) == VFS_SECTOR_SIZE)
-          && (fwrite(nonce, 1, SECTOR_NONCE_SIZE, f) == SECTOR_NONCE_SIZE)
-          && (fwrite(tag, 1, PER_SECTOR_MAC_SIZE, f) == PER_SECTOR_MAC_SIZE);
+    uint8_t rec[SECTOR_RECORD_SIZE];
+    sector_build_record(idx, file_key, plain, rec);
+    int ok = (fwrite(rec, 1, SECTOR_RECORD_SIZE, f) == SECTOR_RECORD_SIZE);
+    secure_zero(rec, SECTOR_RECORD_SIZE);
     return ok ? 0 : -1;
+}
+
+/* -------------------------------------------------------------------------
+ * Parallel dirty-sector flush
+ *
+ * Sector records are mutually independent (each has its own derived key, random
+ * nonce, keystream and MAC), so the CPU-heavy part — building the records — is
+ * embarrassingly parallel.  We split the dirty set across a handful of worker
+ * threads to build every record, then write them back sequentially on the
+ * calling thread (file I/O stays single-threaded, preserving the on-disk
+ * layout exactly).  Threads are spawned per flush *batch*, not per sector, so
+ * pthread_create cost is amortised across the whole dirty set.
+ * ---------------------------------------------------------------------- */
+
+#define SECTOR_FLUSH_MAX_THREADS 8
+
+/* Optional instrumentation: set KRAKKEN_SC_STATS=1 to print, at cache_destroy,
+ * how many sectors were decrypted/encrypted on the parallel batch paths. */
+static unsigned long g_sc_parallel_loaded  = 0;
+static unsigned long g_sc_parallel_flushed = 0;
+
+static int sc_n_threads(void) {
+    const char *e = getenv("KRAKKEN_THREADS");
+    if (e && *e) {
+        int v = atoi(e);
+        if (v >= 1 && v <= SECTOR_FLUSH_MAX_THREADS) return v;
+    }
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) return 4;
+    if (n > SECTOR_FLUSH_MAX_THREADS) return SECTOR_FLUSH_MAX_THREADS;
+    return (int)n;
+}
+
+typedef struct {
+    sector_cache_t *cache;
+    const size_t   *slots;    /* entry indices of the dirty sectors */
+    uint8_t        *records;  /* contiguous SECTOR_RECORD_SIZE blocks */
+    size_t          start;
+    size_t          end;
+} flush_worker_t;
+
+static void *flush_worker(void *arg) {
+    flush_worker_t *w = arg;
+    for (size_t i = w->start; i < w->end; i++) {
+        const cache_entry_t *e = &w->cache->entries[w->slots[i]];
+        sector_build_record(e->sector_idx, w->cache->file_key, e->data,
+                            w->records + i * SECTOR_RECORD_SIZE);
+    }
+    return NULL;
+}
+
+/* Serial fallback used when allocation fails: build + write one at a time. */
+static int flush_dirty_serial(sector_cache_t *cache) {
+    for (size_t i = 0; i < cache->max_cache_size; i++) {
+        cache_entry_t *e = &cache->entries[i];
+        if (e->valid && e->dirty) {
+            if (encrypt_sector_at(cache, e->sector_idx, e->data) != 0)
+                return -1;
+            e->dirty = false;
+        }
+    }
+    return 0;
+}
+
+/*
+ * flush_dirty_batch_parallel – flush every currently-dirty sector.  Records are
+ * built in parallel, then written back sequentially in ascending entry order.
+ * Each flushed entry is marked clean (it stays cached/valid).  Safe to flush
+ * more than strictly required: it only ever writes back accurate data.
+ */
+static int flush_dirty_batch_parallel(sector_cache_t *cache) {
+    size_t n = 0;
+    for (size_t i = 0; i < cache->max_cache_size; i++)
+        if (cache->entries[i].valid && cache->entries[i].dirty) n++;
+    if (n == 0) return 0;
+
+    size_t  *slots   = malloc(n * sizeof(size_t));
+    uint8_t *records = malloc(n * SECTOR_RECORD_SIZE);
+    if (!slots || !records) {
+        free(slots);
+        free(records);
+        return flush_dirty_serial(cache);  /* low-memory fallback */
+    }
+
+    size_t k = 0;
+    for (size_t i = 0; i < cache->max_cache_size; i++)
+        if (cache->entries[i].valid && cache->entries[i].dirty) slots[k++] = i;
+
+    int nt = sc_n_threads();
+    if ((size_t)nt > n) nt = (int)n;
+
+    pthread_t      tids[SECTOR_FLUSH_MAX_THREADS];
+    flush_worker_t workers[SECTOR_FLUSH_MAX_THREADS];
+    size_t base = n / (size_t)nt, extra = n % (size_t)nt, cur = 0;
+    for (int t = 0; t < nt; t++) {
+        workers[t].cache   = cache;
+        workers[t].slots   = slots;
+        workers[t].records = records;
+        workers[t].start   = cur;
+        workers[t].end     = cur + base + ((size_t)t < extra ? 1 : 0);
+        cur = workers[t].end;
+    }
+
+    /* Spawn workers; on any failure run the rest inline on this thread. */
+    int spawned = 0;
+    for (int t = 0; t < nt; t++) {
+        if (pthread_create(&tids[t], NULL, flush_worker, &workers[t]) != 0) {
+            for (int j = t; j < nt; j++) flush_worker(&workers[j]);
+            break;
+        }
+        spawned++;
+    }
+    for (int t = 0; t < spawned; t++) pthread_join(tids[t], NULL);
+
+    /* Sequential write-back in ascending entry order. */
+    int ret = 0;
+    for (size_t i = 0; i < n; i++) {
+        cache_entry_t *e = &cache->entries[slots[i]];
+        const off_t off = (off_t)cache->data_offset
+                        + (off_t)e->sector_idx * (off_t)SECTOR_RECORD_SIZE;
+        if (fseeko(cache->file, off, SEEK_SET) != 0 ||
+            fwrite(records + i * SECTOR_RECORD_SIZE, 1, SECTOR_RECORD_SIZE,
+                   cache->file) != SECTOR_RECORD_SIZE) {
+            ret = -1;
+            break;
+        }
+        e->dirty = false;
+    }
+    g_sc_parallel_flushed += n;
+
+    secure_zero(records, n * SECTOR_RECORD_SIZE);
+    free(records);
+    free(slots);
+    return ret;
 }
 
 /*
@@ -148,28 +300,27 @@ static int encrypt_sector_at(sector_cache_t *cache, uint64_t sector_idx,
  * under the file_key, and decrypt into `out_plain`.  Single format: no key
  * fallback.
  */
-static int decrypt_sector_at(sector_cache_t *cache, uint64_t sector_idx,
-                              uint8_t *out_plain) {
-    const off_t file_off = (off_t)cache->data_offset
-                         + (off_t)sector_idx * (off_t)SECTOR_RECORD_SIZE;
+/*
+ * sector_open_record – authenticate one on-disk record `rec`
+ * ([cipher][nonce][tag], SECTOR_RECORD_SIZE bytes) for sector `idx` under
+ * `file_key` and decrypt into `out_plain`.  Pure w.r.t. shared state (reads
+ * only file_key + rec, writes only out_plain), so many records may be opened
+ * concurrently.  This is the read-side twin of sector_build_record: one shared
+ * definition of the format for the serial and parallel paths.  Returns 0 on
+ * success, -1 on authentication failure.
+ */
+static int sector_open_record(uint64_t idx, const uint8_t *file_key,
+                              const uint8_t *rec, uint8_t *out_plain) {
+    const uint8_t *cipher = rec;
+    const uint8_t *nonce  = rec + VFS_SECTOR_SIZE;
+    const uint8_t *tag    = rec + VFS_SECTOR_SIZE + SECTOR_NONCE_SIZE;
 
     uint8_t sector_key[KEY_SIZE];
-    uint8_t cipher[VFS_SECTOR_SIZE];
-    uint8_t nonce[SECTOR_NONCE_SIZE];
-    uint8_t stored_tag[PER_SECTOR_MAC_SIZE], computed_tag[PER_SECTOR_MAC_SIZE];
+    derive_sector_key(file_key, idx, sector_key);
 
-    if (fseeko(cache->file, file_off, SEEK_SET) != 0)
-        return -1;
-
-    if (fread(cipher, 1, VFS_SECTOR_SIZE, cache->file) != VFS_SECTOR_SIZE ||
-        fread(nonce, 1, SECTOR_NONCE_SIZE, cache->file) != SECTOR_NONCE_SIZE ||
-        fread(stored_tag, 1, PER_SECTOR_MAC_SIZE, cache->file) != PER_SECTOR_MAC_SIZE)
-        return -1;
-
-    derive_sector_key(cache->file_key, sector_idx, sector_key);
-    sector_mac(sector_key, sector_idx, nonce, cipher, computed_tag);
-
-    if (ct_memcmp(stored_tag, computed_tag, PER_SECTOR_MAC_SIZE) != 0) {
+    uint8_t computed_tag[PER_SECTOR_MAC_SIZE];
+    sector_mac(sector_key, idx, nonce, cipher, computed_tag);
+    if (ct_memcmp(tag, computed_tag, PER_SECTOR_MAC_SIZE) != 0) {
         secure_zero(sector_key, KEY_SIZE);
         return -1;
     }
@@ -177,6 +328,23 @@ static int decrypt_sector_at(sector_cache_t *cache, uint64_t sector_idx,
     sector_keystream_xor(sector_key, nonce, cipher, out_plain);
     secure_zero(sector_key, KEY_SIZE);
     return 0;
+}
+
+static int decrypt_sector_at(sector_cache_t *cache, uint64_t sector_idx,
+                              uint8_t *out_plain) {
+    const off_t file_off = (off_t)cache->data_offset
+                         + (off_t)sector_idx * (off_t)SECTOR_RECORD_SIZE;
+
+    if (fseeko(cache->file, file_off, SEEK_SET) != 0)
+        return -1;
+
+    uint8_t rec[SECTOR_RECORD_SIZE];
+    if (fread(rec, 1, SECTOR_RECORD_SIZE, cache->file) != SECTOR_RECORD_SIZE)
+        return -1;
+
+    int r = sector_open_record(sector_idx, cache->file_key, rec, out_plain);
+    secure_zero(rec, SECTOR_RECORD_SIZE);
+    return r;
 }
 
 /*
@@ -292,6 +460,13 @@ void cache_destroy(sector_cache_t *cache) {
 
     free(cache->entries);
     free(cache);
+
+    if (getenv("KRAKKEN_SC_STATS")) {
+        fprintf(stderr,
+                "[sector_cache] parallel sectors: %lu decrypted (read), "
+                "%lu encrypted (flush)\n",
+                g_sc_parallel_loaded, g_sc_parallel_flushed);
+    }
 }
 
 /*
@@ -324,9 +499,15 @@ int cache_get_sector(sector_cache_t *cache, uint64_t sector_idx, uint8_t **data)
 
     cache_entry_t *e = &cache->entries[slot];
 
-    /* Flush dirty data before evicting the old occupant. */
+    /*
+     * Flush dirty data before evicting the old occupant.  Rather than write
+     * back just this one victim serially, flush the whole dirty set in
+     * parallel: the victim becomes clean (and reusable), and the many other
+     * dirty sectors a large copy accumulates are cleaned in one parallel batch,
+     * so subsequent evictions find clean slots and skip I/O entirely.
+     */
     if (e->valid && !e->pinned && e->dirty) {
-        if (cache_flush_sector(cache, e->sector_idx) != 0)
+        if (flush_dirty_batch_parallel(cache) != 0)
             return -1;
     }
 
@@ -362,6 +543,205 @@ int cache_get_sector(sector_cache_t *cache, uint64_t sector_idx, uint8_t **data)
 
     *data = e->data;
     return 0;
+}
+
+/*
+ * cache_get_sector_overwrite – obtain a writable buffer for `sector_idx`
+ * WITHOUT loading/decrypting its previous on-disk contents.  Intended for the
+ * case where the caller will overwrite the ENTIRE sector (e.g. a full-sector
+ * file copy), so the read + MAC-verify + keystream-decrypt of the old contents
+ * would be pure waste.  Skipping it removes the serial decrypt that otherwise
+ * dominates the write path, leaving the parallel flush as the real cost.
+ *
+ * Contract: the caller MUST fill all VFS_SECTOR_SIZE bytes of *data and then
+ * call cache_mark_dirty(); the returned buffer may hold stale plaintext from a
+ * previous occupant until overwritten.
+ */
+int cache_get_sector_overwrite(sector_cache_t *cache, uint64_t sector_idx,
+                               uint8_t **data) {
+    if (!cache || !data || sector_idx >= cache->total_sectors)
+        return -1;
+
+    /* Already cached: reuse the slot (its contents will be fully overwritten). */
+    for (size_t i = 0; i < cache->max_cache_size; i++) {
+        if (cache->entries[i].valid &&
+            cache->entries[i].sector_idx == sector_idx) {
+            *data = cache->entries[i].data;
+            cache->entries[i].last_access = cache->access_counter++;
+            return 0;
+        }
+    }
+
+    size_t slot = lru_victim(cache);
+    if (slot == SIZE_MAX)
+        return -1;
+
+    cache_entry_t *e = &cache->entries[slot];
+
+    /* Same parallel write-back as the normal eviction path. */
+    if (e->valid && !e->pinned && e->dirty) {
+        if (flush_dirty_batch_parallel(cache) != 0)
+            return -1;
+    }
+
+    /* Claim the slot for the new sector — no decrypt_sector_at() load. */
+    e->sector_idx  = sector_idx;
+    e->valid       = true;
+    e->dirty       = false;
+    e->pinned      = false;
+    e->last_access = cache->access_counter++;
+
+    mlock(e->data, VFS_SECTOR_SIZE);  /* best-effort; non-fatal on failure */
+
+    *data = e->data;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Parallel batch prefetch (read path)
+ *
+ * Loads a run of sectors into the cache: the records are read from disk
+ * sequentially on this thread (the FILE* offset is single-threaded), then the
+ * CPU-heavy MAC-verify + keystream-decrypt is fanned out across worker threads.
+ * After a successful prefetch, the normal per-sector cache_get_sector() calls
+ * in vfs_read_data become pure cache hits with no decrypt.
+ *
+ * Sectors already resident in the cache (possibly dirty) are left untouched, so
+ * unflushed modifications are never shadowed by stale on-disk data.
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    sector_cache_t *cache;
+    const size_t   *slots;    /* cache slot for each job */
+    const uint64_t *idxs;     /* sector index for each job */
+    const uint8_t  *records;  /* contiguous SECTOR_RECORD_SIZE blocks */
+    int            *fail;     /* per-job failure flags */
+    size_t          start;
+    size_t          end;
+} load_worker_t;
+
+static void *load_worker(void *arg) {
+    load_worker_t *w = arg;
+    for (size_t j = w->start; j < w->end; j++) {
+        uint8_t *dst = w->cache->entries[w->slots[j]].data;
+        if (sector_open_record(w->idxs[j], w->cache->file_key,
+                               w->records + j * SECTOR_RECORD_SIZE, dst) != 0)
+            w->fail[j] = 1;
+    }
+    return NULL;
+}
+
+/*
+ * cache_prefetch_batch – ensure sectors [start, start+count) are resident,
+ * loading the missing ones in parallel.  `count` is capped internally.
+ * Returns 0 on success (best-effort: on allocation failure it simply returns 0
+ * and lets the caller fall back to per-sector loads); -1 only on a hard I/O or
+ * authentication failure, which the caller must propagate.
+ */
+int cache_prefetch_batch(sector_cache_t *cache, uint64_t start, size_t count) {
+    if (!cache) return -1;
+    if (count > SECTOR_PREFETCH_CAP) count = SECTOR_PREFETCH_CAP;
+    if (count == 0) return 0;
+
+    size_t   *slots   = malloc(count * sizeof(size_t));
+    uint64_t *idxs    = malloc(count * sizeof(uint64_t));
+    uint8_t  *records = malloc(count * SECTOR_RECORD_SIZE);
+    int      *fail    = calloc(count, sizeof(int));
+    if (!slots || !idxs || !records || !fail) {
+        free(slots); free(idxs); free(records); free(fail);
+        return 0;  /* non-fatal: caller falls back to serial cache_get_sector */
+    }
+
+    int ret = 0;
+    size_t njobs = 0;
+    for (size_t s = 0; s < count; s++) {
+        uint64_t idx = start + s;
+        if (idx >= cache->total_sectors) break;
+
+        /* Already cached? Touch LRU and skip — never shadow a dirty sector. */
+        int hit = 0;
+        for (size_t i = 0; i < cache->max_cache_size; i++) {
+            if (cache->entries[i].valid && cache->entries[i].sector_idx == idx) {
+                cache->entries[i].last_access = cache->access_counter++;
+                hit = 1;
+                break;
+            }
+        }
+        if (hit) continue;
+
+        size_t slot = lru_victim(cache);
+        if (slot == SIZE_MAX) break;  /* all pinned: leave the rest to caller */
+
+        cache_entry_t *e = &cache->entries[slot];
+        if (e->valid && !e->pinned && e->dirty) {
+            if (flush_dirty_batch_parallel(cache) != 0) { ret = -1; goto done; }
+        }
+
+        /* Sequential record read into the staging buffer. */
+        const off_t off = (off_t)cache->data_offset
+                        + (off_t)idx * (off_t)SECTOR_RECORD_SIZE;
+        if (fseeko(cache->file, off, SEEK_SET) != 0 ||
+            fread(records + njobs * SECTOR_RECORD_SIZE, 1, SECTOR_RECORD_SIZE,
+                  cache->file) != SECTOR_RECORD_SIZE) {
+            ret = -1;
+            goto done;
+        }
+
+        /* Claim the slot (decrypt fills e->data in the worker below). */
+        cache_wipe_sector(e->data);
+        e->sector_idx  = idx;
+        e->valid       = true;
+        e->dirty       = false;
+        e->pinned      = false;
+        e->last_access = cache->access_counter++;
+        mlock(e->data, VFS_SECTOR_SIZE);
+
+        slots[njobs] = slot;
+        idxs[njobs]  = idx;
+        njobs++;
+    }
+
+    if (njobs == 0) goto done;
+
+    int nt = sc_n_threads();
+    if ((size_t)nt > njobs) nt = (int)njobs;
+
+    pthread_t     tids[SECTOR_FLUSH_MAX_THREADS];
+    load_worker_t wk[SECTOR_FLUSH_MAX_THREADS];
+    size_t base = njobs / (size_t)nt, extra = njobs % (size_t)nt, cur = 0;
+    for (int t = 0; t < nt; t++) {
+        wk[t].cache = cache; wk[t].slots = slots; wk[t].idxs = idxs;
+        wk[t].records = records; wk[t].fail = fail;
+        wk[t].start = cur;
+        wk[t].end   = cur + base + ((size_t)t < extra ? 1 : 0);
+        cur = wk[t].end;
+    }
+    int spawned = 0;
+    for (int t = 0; t < nt; t++) {
+        if (pthread_create(&tids[t], NULL, load_worker, &wk[t]) != 0) {
+            for (int j = t; j < nt; j++) load_worker(&wk[j]);
+            break;
+        }
+        spawned++;
+    }
+    for (int t = 0; t < spawned; t++) pthread_join(tids[t], NULL);
+
+    /* Any authentication failure invalidates that slot and fails the batch. */
+    for (size_t j = 0; j < njobs; j++) {
+        if (fail[j]) {
+            cache_entry_t *e = &cache->entries[slots[j]];
+            cache_wipe_sector(e->data);
+            e->valid = false;
+            e->sector_idx = UINT64_MAX;
+            ret = -1;
+        }
+    }
+    g_sc_parallel_loaded += njobs;
+
+done:
+    secure_zero(records, count * SECTOR_RECORD_SIZE);
+    free(slots); free(idxs); free(records); free(fail);
+    return ret;
 }
 
 /* Mark a cached sector as dirty (will be flushed on eviction or explicit flush). */
@@ -425,17 +805,14 @@ int cache_flush_sector(sector_cache_t *cache, uint64_t sector_idx) {
     return 0;  /* Sector not dirty or not found — nothing to do. */
 }
 
-/* Flush every dirty sector to disk. */
+/* Flush every dirty sector to disk (records built in parallel). */
 int cache_flush_all(sector_cache_t *cache) {
     if (!cache)
         return -1;
 
-    for (size_t i = 0; i < cache->max_cache_size; i++) {
-        if (cache->entries[i].valid && cache->entries[i].dirty) {
-            if (cache_flush_sector(cache, cache->entries[i].sector_idx) != 0)
-                return -1;
-        }
-    }
+    if (flush_dirty_batch_parallel(cache) != 0)
+        return -1;
+
     fflush(cache->file);
     return 0;
 }

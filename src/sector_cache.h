@@ -56,6 +56,23 @@ int sector_encrypt_write(FILE *f, uint64_t idx,
 
 /* Sector access operations */
 int cache_get_sector(sector_cache_t *cache, uint64_t sector_idx, uint8_t **data);
+/*
+ * cache_get_sector_overwrite – like cache_get_sector but skips loading the
+ * sector's previous on-disk contents.  ONLY valid when the caller fills the
+ * entire VFS_SECTOR_SIZE buffer before marking it dirty (full-sector
+ * overwrite).  Avoids a wasted read + MAC + decrypt on the write path.
+ */
+int cache_get_sector_overwrite(sector_cache_t *cache, uint64_t sector_idx,
+                               uint8_t **data);
+/*
+ * cache_prefetch_batch – load sectors [start, start+count) into the cache,
+ * decrypting/verifying the missing ones in parallel.  `count` is capped
+ * internally.  Returns -1 on a hard I/O or authentication failure (the caller
+ * must propagate it); 0 otherwise (best-effort — any sectors it could not load
+ * are simply fetched serially by the following cache_get_sector calls).
+ */
+#define SECTOR_PREFETCH_CAP 256
+int cache_prefetch_batch(sector_cache_t *cache, uint64_t start, size_t count);
 int cache_mark_dirty(sector_cache_t *cache, uint64_t sector_idx);
 int cache_pin_sector(sector_cache_t *cache, uint64_t sector_idx);
 
