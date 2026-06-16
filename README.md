@@ -1,4 +1,4 @@
-<h1 align="center">🐙 Krakken-Disk v5.0.0 (Butterfly Edition)</h1>
+<h1 align="center"><a href="https://github.com/effjy/krakken-disk-butterfly-cli/"><img src="titles/krakken-disk-v500-butterfly-edition-title.svg" height="44" alt="Krakken-Disk v5.0.0 (Butterfly Edition)"></a></h1>
 
 <div align="center">
 
