@@ -96,8 +96,8 @@ int volume_create(const char *path, size_t size_mb, const char *password,
     permut2048_absorb(&ctx, (const uint8_t *)"HEADER", 6);
     permut2048_finalize(&ctx);
     permut2048_encrypt(&ctx, plain_header, encrypted_header, HEADER_RESERVE);
-    /* Corrected duplex tag (permute-then-squeeze). Old volumes carry the
-     * legacy degenerate tag and are still accepted on open via fallback. */
+    /* Corrected duplex tag (permute-then-squeeze). The legacy degenerate tag is
+     * no longer produced, and the open path no longer accepts it. */
     permut2048_squeeze_tag(&ctx, encrypted_header + HEADER_RESERVE, TAG_SIZE);
     
     secure_zero(&ctx, sizeof(ctx));

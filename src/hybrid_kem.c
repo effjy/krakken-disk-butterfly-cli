@@ -108,7 +108,7 @@ void wrap_hybrid_sk(const uint8_t *hybrid_sk, const uint8_t *master_key,
     permut2048_absorb(&ctx, (const uint8_t *)"WRAP", 4);
     permut2048_finalize(&ctx);
     permut2048_encrypt(&ctx, hybrid_sk, ciphertext_out, HYBRID_SK_LEN);
-    /* Corrected duplex tag; old volumes verify via the legacy fallback. */
+    /* Duplex tag (permute-then-squeeze); the legacy degenerate tag is no longer produced or accepted. */
     permut2048_squeeze_tag(&ctx, ciphertext_out + HYBRID_SK_LEN, WRAP_ABYTES);
     secure_zero(&ctx, sizeof(ctx));
 }
@@ -158,11 +158,13 @@ int hybrid_encapsulate(uint8_t *shared_secret, uint8_t *kem_ct,
         return -1;
     }
     
-    crypto_generichash_state st;
-    crypto_generichash_init(&st, (const uint8_t*)"HYBRID", 6, KEY_SIZE);
-    crypto_generichash_update(&st, ss_kyber, KYBER_SSBYTES);
-    crypto_generichash_update(&st, ss_x, X448_PUBKEY_LEN);
-    crypto_generichash_final(&st, shared_secret, KEY_SIZE);
+    permut2048_ctx st = { .rate = PERMUT2048_RATE };
+    permut2048_absorb(&st, (const uint8_t*)"HYBRID", 6);
+    permut2048_absorb(&st, ss_kyber, KYBER_SSBYTES);
+    permut2048_absorb(&st, ss_x, X448_PUBKEY_LEN);
+    permut2048_finalize(&st);
+    permut2048_squeeze(&st, shared_secret, KEY_SIZE);
+    secure_zero(&st, sizeof(st));
     
     memcpy(kem_ct, ct_kyber, KYBER_CIPHERTEXTBYTES);
     memcpy(kem_ct + KYBER_CIPHERTEXTBYTES, eph_pub, X448_PUBKEY_LEN);
@@ -186,11 +188,13 @@ int hybrid_decapsulate(uint8_t *shared_secret, const uint8_t *kem_ct,
         return -1;
     }
     
-    crypto_generichash_state st;
-    crypto_generichash_init(&st, (const uint8_t*)"HYBRID", 6, KEY_SIZE);
-    crypto_generichash_update(&st, ss_kyber, KYBER_SSBYTES);
-    crypto_generichash_update(&st, ss_x, X448_PUBKEY_LEN);
-    crypto_generichash_final(&st, shared_secret, KEY_SIZE);
+    permut2048_ctx st = { .rate = PERMUT2048_RATE };
+    permut2048_absorb(&st, (const uint8_t*)"HYBRID", 6);
+    permut2048_absorb(&st, ss_kyber, KYBER_SSBYTES);
+    permut2048_absorb(&st, ss_x, X448_PUBKEY_LEN);
+    permut2048_finalize(&st);
+    permut2048_squeeze(&st, shared_secret, KEY_SIZE);
+    secure_zero(&st, sizeof(st));
     
     secure_zero(ss_kyber, KYBER_SSBYTES);
     secure_zero(ss_x, X448_PUBKEY_LEN);

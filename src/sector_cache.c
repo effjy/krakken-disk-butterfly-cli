@@ -52,15 +52,21 @@ static void store_le64(uint8_t p[8], uint64_t v) {
 }
 
 /*
- * derive_sector_key – per-sector key = BLAKE2b(file_key, key=LE64(idx)).
- * Uses an explicit little-endian index so volumes are portable across
- * byte orders.
+ * derive_sector_key – per-sector key = Krakken(file_key || LE64(idx) || "K5KDF").
+ * Keyed sponge (the file key is absorbed first); explicit little-endian index so
+ * volumes are portable across byte orders.
  */
 static void derive_sector_key(const uint8_t *file_key, uint64_t idx,
                               uint8_t out_key[KEY_SIZE]) {
     uint8_t idx_le[8];
     store_le64(idx_le, idx);
-    crypto_generichash(out_key, KEY_SIZE, file_key, KEY_SIZE, idx_le, sizeof(idx_le));
+    permut2048_ctx kdf = { .rate = PERMUT2048_RATE };
+    permut2048_absorb(&kdf, file_key, KEY_SIZE);
+    permut2048_absorb(&kdf, idx_le, sizeof(idx_le));
+    permut2048_absorb(&kdf, (const uint8_t *)"K5KDF", 5);
+    permut2048_finalize(&kdf);
+    permut2048_squeeze(&kdf, out_key, KEY_SIZE);
+    secure_zero(&kdf, sizeof(kdf));
 }
 
 /*
@@ -88,21 +94,25 @@ static void sector_keystream_xor(const uint8_t *sector_key, const uint8_t *nonce
 }
 
 /*
- * sector_mac – MAC = BLAKE2b(key=sector_key) over LE64(idx) || nonce || cipher.
- * The stored nonce is authenticated so it cannot be swapped to redirect the
- * keystream of an otherwise-valid ciphertext.
+ * sector_mac – MAC = keyed sponge over sector_key || LE64(idx) || nonce || cipher,
+ * finished with the permute-then-squeeze duplex tag.  The stored nonce is
+ * authenticated so it cannot be swapped to redirect the keystream of an
+ * otherwise-valid ciphertext.
  */
 static void sector_mac(const uint8_t *sector_key, uint64_t idx,
                        const uint8_t *nonce, const uint8_t *cipher,
                        uint8_t out_tag[PER_SECTOR_MAC_SIZE]) {
     uint8_t idx_le[8];
     store_le64(idx_le, idx);
-    crypto_generichash_state mac;
-    crypto_generichash_init(&mac, sector_key, KEY_SIZE, PER_SECTOR_MAC_SIZE);
-    crypto_generichash_update(&mac, idx_le, sizeof(idx_le));
-    crypto_generichash_update(&mac, nonce, SECTOR_NONCE_SIZE);
-    crypto_generichash_update(&mac, cipher, VFS_SECTOR_SIZE);
-    crypto_generichash_final(&mac, out_tag, PER_SECTOR_MAC_SIZE);
+    permut2048_ctx mac = { .rate = PERMUT2048_RATE };
+    permut2048_absorb(&mac, sector_key, KEY_SIZE);
+    permut2048_absorb(&mac, idx_le, sizeof(idx_le));
+    permut2048_absorb(&mac, nonce, SECTOR_NONCE_SIZE);
+    permut2048_absorb(&mac, cipher, VFS_SECTOR_SIZE);
+    permut2048_absorb(&mac, (const uint8_t *)"K5MAC", 5);
+    permut2048_finalize(&mac);
+    permut2048_squeeze_tag(&mac, out_tag, PER_SECTOR_MAC_SIZE);
+    secure_zero(&mac, sizeof(mac));
 }
 
 /*

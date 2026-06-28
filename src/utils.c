@@ -92,9 +92,14 @@ int check_swap_security(void) {
             char device[256], type[64], size[64], used[64], priority[64];
             if (sscanf(line, "%255s %63s %63s %63s %63s", 
                       device, type, size, used, priority) == 5) {
-                /* Check if it's a partition (not a file) and not encrypted */
-                if (strncmp(device, "/dev/", 5) == 0 && 
-                    strstr(device, "crypt") == NULL) {
+                /* Flag any swap we can't confirm is encrypted:
+                 *  - a block device (/dev/...) whose name doesn't look like a
+                 *    dm-crypt mapping, OR
+                 *  - a file-backed swap (Type "file", e.g. /swapfile), which
+                 *    /proc/swaps reports with a plain path, not a /dev/ node. */
+                if ((strncmp(device, "/dev/", 5) == 0 &&
+                     strstr(device, "crypt") == NULL) ||
+                    strcmp(type, "file") == 0) {
                     has_unencrypted_swap = 1;
                     break;
                 }
